@@ -1,56 +1,71 @@
-// Import required modules
-const express = require('express'); // Express is a minimal Node.js framework for building web applications.
-const amqp = require('amqplib/callback_api'); // AMQP (Advanced Message Queuing Protocol) client library for RabbitMQ.
-const cors = require('cors'); // CORS (Cross-Origin Resource Sharing) middleware for handling cross-origin requests.
-require('dotenv').config(); // Load environment variables from .env file in development
+// Load env, core libs, and middleware
+require('dotenv').config();
+const express = require('express');
+const amqp = require('amqplib/callback_api'); // callback API is fine for the lab
+const cors = require('cors');
 
-const app = express(); // Create an Express application instance.
-app.use(express.json()); // Middleware to parse incoming JSON request bodies.
-
-// Enable CORS (Cross-Origin Resource Sharing) for all routes
+const app = express();
+app.use(express.json());
 app.use(cors());
 
-// Get the RabbitMQ URL and the port from environment variables
-const RABBITMQ_CONNECTION_STRING = process.env.RABBITMQ_CONNECTION_STRING || 'amqp://localhost';  // Fallback to localhost if not defined
-const PORT = process.env.PORT || 3000;  // Fallback to port 3000 if not defined
+// ---- Config (12-Factor via env) ----
+const PORT = process.env.PORT || 3000; // Azure injects PORT
+const RABBITMQ_CONNECTION_STRING =
+  process.env.RABBITMQ_CONNECTION_STRING || 'amqp://localhost';
+const ORDER_QUEUE = process.env.ORDER_QUEUE || 'order_queue';
 
-// Define a POST route for creating orders
-app.post('/orders', (req, res) => {
-  const order = req.body; // Extract the order data from the request body.
-  
-  // Connect to RabbitMQ server
+// ---- Health endpoints ----
+app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
+
+// Optional: verify we can connect to RabbitMQ and publish a tiny ping
+app.get('/healthz/rabbitmq', (_req, res) => {
   amqp.connect(RABBITMQ_CONNECTION_STRING, (err, conn) => {
-    if (err) {
-      // If an error occurs while connecting to RabbitMQ, send a 500 status and error message.
-      return res.status(500).send('Error connecting to RabbitMQ');
-    }
+    if (err) return res.status(503).json({ status: 'error', detail: 'connect failed' });
 
-    // Once connected to RabbitMQ, create a channel to communicate with it.
-    conn.createChannel((err, channel) => {
-      if (err) {
-        // If an error occurs while creating a channel, send a 500 status and error message.
-        return res.status(500).send('Error creating channel');
+    conn.createChannel((err2, ch) => {
+      if (err2) {
+        conn.close();
+        return res.status(503).json({ status: 'error', detail: 'channel failed' });
       }
-
-      const queue = 'order_queue'; // Define the queue where the order will be sent.
-      const msg = JSON.stringify(order); // Convert the order object to a JSON string.
-
-      // Assert (create) the queue if it doesn't already exist.
-      channel.assertQueue(queue, { durable: false });
-
-      // Send the order message to the queue.
-      channel.sendToQueue(queue, Buffer.from(msg));
-
-      // Log the sent order to the console.
-      console.log("Sent order to queue:", msg);
-
-      // Send a response to the client confirming that the order was received.
-      res.send('Order received');
+      ch.assertQueue(ORDER_QUEUE, { durable: false });
+      ch.sendToQueue(ORDER_QUEUE, Buffer.from('ping'));
+      // Close politely after a short delay so the broker flushes the frame
+      setTimeout(() => { try { ch.close(); conn.close(); } catch(_){} }, 200);
+      res.json({ status: 'ok', queue: ORDER_QUEUE });
     });
   });
 });
 
-// Start the server using the port from environment variables
+// ---- Orders endpoint ----
+app.post('/orders', (req, res) => {
+  const order = req.body;
+
+  amqp.connect(RABBITMQ_CONNECTION_STRING, (err, conn) => {
+    if (err) {
+      console.error('RabbitMQ connect error:', err.message);
+      return res.status(500).send('Error connecting to RabbitMQ');
+    }
+
+    conn.createChannel((err2, ch) => {
+      if (err2) {
+        console.error('RabbitMQ channel error:', err2.message);
+        try { conn.close(); } catch(_) {}
+        return res.status(500).send('Error creating channel');
+      }
+
+      ch.assertQueue(ORDER_QUEUE, { durable: false });
+      const msg = JSON.stringify(order);
+      ch.sendToQueue(ORDER_QUEUE, Buffer.from(msg));
+      console.log('Sent order to queue:', msg);
+
+      // respond immediately; then close channel/connection shortly after
+      res.send('Order received');
+      setTimeout(() => { try { ch.close(); conn.close(); } catch(_) {} }, 200);
+    });
+  });
+});
+
+// ---- Start server ----
 app.listen(PORT, () => {
-  console.log(`Order service is running on http://localhost:${PORT}`);
+  console.log(`order-service listening on http://localhost:${PORT}`);
 });
